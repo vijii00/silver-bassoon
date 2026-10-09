@@ -1,0 +1,594 @@
+name: Build iOS runtime test
+
+# How to use: Actions tab -> "Build iOS runtime test" -> Run workflow.
+# Everything (app code, project files) is written by the steps below,
+# so this is the only file the repo needs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_monomod:
+        description: "Include the MonoMod hook test"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Select Xcode 26
+        run: |
+          set -eo pipefail
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | grep -viE 'beta|candidate|_rc' | sort -V | tail -n 1 || true)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install iOS workload
+        run: |
+          set -eo pipefail
+          dotnet --info
+          dotnet workload install ios
+          dotnet workload list
+
+      - name: Write project files
+        run: |
+          set -eo pipefail
+          mkdir -p poc/App poc/TestMod
+
+          cat > poc/TestMod/TestMod.csproj <<'EOF_A'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>netstandard2.0</TargetFramework>
+              <AssemblyName>TestMod</AssemblyName>
+              <LangVersion>latest</LangVersion>
+            </PropertyGroup>
+          </Project>
+          EOF_A
+
+          cat > poc/TestMod/ModEntry.cs <<'EOF_B'
+          namespace TestMod
+          {
+              public static class ModEntry
+              {
+                  public static string Run()
+                  {
+                      return "Hello from a loaded mod assembly (" + typeof(ModEntry).Assembly.GetName().Name + ")";
+                  }
+
+                  public static long Bench(int n)
+                  {
+                      long s = 0;
+                      for (int i = 1; i <= n; i++)
+                      {
+                          s += (i * 7L) % 13 + (i ^ (i >> 3));
+                      }
+                      return s;
+                  }
+              }
+          }
+          EOF_B
+
+          cat > poc/App/TMLiOSTest.csproj <<'EOF_C'
+          <Project Sdk="Microsoft.NET.Sdk">
+
+            <PropertyGroup>
+              <TargetFramework>net10.0-ios</TargetFramework>
+              <OutputType>Exe</OutputType>
+              <AssemblyName>TMLiOSTest</AssemblyName>
+              <RootNamespace>TMLiOSTest</RootNamespace>
+              <Nullable>disable</Nullable>
+              <ImplicitUsings>disable</ImplicitUsings>
+              <LangVersion>latest</LangVersion>
+              <SupportedOSPlatformVersion>15.0</SupportedOSPlatformVersion>
+              <UseInterpreter>true</UseInterpreter>
+              <MtouchLink>None</MtouchLink>
+            </PropertyGroup>
+
+            <ItemGroup>
+              <EmbeddedResource Include="TestMod.dll" LogicalName="TestMod.dll" />
+            </ItemGroup>
+
+            <ItemGroup Condition="'$(WithMonoMod)' == 'true'">
+              <PackageReference Include="MonoMod.RuntimeDetour" Version="*" />
+            </ItemGroup>
+
+          </Project>
+          EOF_C
+
+          cat > poc/App/Info.plist <<'EOF_D'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key>
+            <string>TML iOS Test</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.tmltest.ios</string>
+            <key>CFBundleName</key>
+            <string>TMLiOSTest</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>LSRequiresIPhoneOS</key>
+            <true/>
+            <key>MinimumOSVersion</key>
+            <string>15.0</string>
+            <key>UIDeviceFamily</key>
+            <array>
+              <integer>1</integer>
+              <integer>2</integer>
+            </array>
+            <key>UIRequiredDeviceCapabilities</key>
+            <array>
+              <string>arm64</string>
+            </array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+            </array>
+            <key>UIFileSharingEnabled</key>
+            <true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key>
+            <true/>
+            <key>UILaunchScreen</key>
+            <dict/>
+          </dict>
+          </plist>
+          EOF_D
+
+          cat > poc/App/Main.cs <<'EOF_E'
+          using UIKit;
+
+          namespace TMLiOSTest
+          {
+              public class Application
+              {
+                  static void Main(string[] args)
+                  {
+                      UIApplication.Main(args, null, typeof(AppDelegate));
+                  }
+              }
+          }
+          EOF_E
+
+          cat > poc/App/AppDelegate.cs <<'EOF_F'
+          using Foundation;
+          using UIKit;
+
+          namespace TMLiOSTest
+          {
+              [Register("AppDelegate")]
+              public class AppDelegate : UIApplicationDelegate
+              {
+                  public override UIWindow Window { get; set; }
+
+                  public override bool FinishedLaunching(UIApplication application, NSDictionary launchOptions)
+                  {
+                      Window = new UIWindow(UIScreen.MainScreen.Bounds);
+                      Window.RootViewController = new MainViewController();
+                      Window.MakeKeyAndVisible();
+                      return true;
+                  }
+              }
+          }
+          EOF_F
+
+          cat > poc/App/MainViewController.cs <<'EOF_G'
+          using System;
+          using System.IO;
+          using System.Threading.Tasks;
+          using Foundation;
+          using UIKit;
+
+          namespace TMLiOSTest
+          {
+              public class MainViewController : UIViewController
+              {
+                  UITextView text;
+                  UIButton basicButton;
+                  UIButton hookButton;
+
+                  public override void ViewDidLoad()
+                  {
+                      base.ViewDidLoad();
+                      View.BackgroundColor = UIColor.SystemBackground;
+
+                      basicButton = UIButton.FromType(UIButtonType.System);
+                      basicButton.SetTitle("Run basic tests", UIControlState.Normal);
+                      basicButton.TouchUpInside += (s, e) => Run(false);
+
+                      hookButton = UIButton.FromType(UIButtonType.System);
+                      hookButton.SetTitle("MonoMod test (may crash)", UIControlState.Normal);
+                      hookButton.TouchUpInside += (s, e) => Run(true);
+
+                      var stack = new UIStackView(new UIView[] { basicButton, hookButton })
+                      {
+                          Axis = UILayoutConstraintAxis.Horizontal,
+                          Spacing = 12,
+                          Distribution = UIStackViewDistribution.FillEqually,
+                          TranslatesAutoresizingMaskIntoConstraints = false
+                      };
+
+                      text = new UITextView
+                      {
+                          Editable = false,
+                          Font = UIFont.FromName("Menlo-Regular", 11) ?? UIFont.SystemFontOfSize(11),
+                          BackgroundColor = UIColor.SecondarySystemBackground,
+                          TranslatesAutoresizingMaskIntoConstraints = false
+                      };
+
+                      View.AddSubview(stack);
+                      View.AddSubview(text);
+                      var g = View.SafeAreaLayoutGuide;
+                      NSLayoutConstraint.ActivateConstraints(new NSLayoutConstraint[]
+                      {
+                          stack.TopAnchor.ConstraintEqualTo(g.TopAnchor, 8),
+                          stack.LeadingAnchor.ConstraintEqualTo(g.LeadingAnchor, 8),
+                          stack.TrailingAnchor.ConstraintEqualTo(g.TrailingAnchor, -8),
+                          text.TopAnchor.ConstraintEqualTo(stack.BottomAnchor, 8),
+                          text.LeadingAnchor.ConstraintEqualTo(g.LeadingAnchor, 8),
+                          text.TrailingAnchor.ConstraintEqualTo(g.TrailingAnchor, -8),
+                          text.BottomAnchor.ConstraintEqualTo(g.BottomAnchor, -8)
+                      });
+
+                      text.Text = Header() + "Tap 'Run basic tests'.";
+                  }
+
+                  static string Header()
+                  {
+                      return "TML iOS runtime test\n" +
+                             "Last MonoMod test: " + Tests.PreviousMonoModState() + "\n" +
+                             "For the JIT check: open the app, enable JIT for it (StikDebug), then tap 'Run basic tests' again.\n" +
+                             "------------------------------\n";
+                  }
+
+                  void Run(bool monomod)
+                  {
+                      basicButton.Enabled = false;
+                      hookButton.Enabled = false;
+                      text.Text = Header() + "Running...";
+
+                      Task.Run(() =>
+                      {
+                          string report;
+                          try
+                          {
+                              report = monomod ? "== MonoMod hook\n" + Tests.RunMonoMod() : Tests.RunBasic();
+                          }
+                          catch (Exception e)
+                          {
+                              report = "Crashed: " + e;
+                          }
+
+                          try
+                          {
+                              File.WriteAllText(Path.Combine(Tests.DocsDir, "poc-report.txt"), report);
+                          }
+                          catch (Exception)
+                          {
+                          }
+
+                          BeginInvokeOnMainThread(() =>
+                          {
+                              text.Text = Header() + report;
+                              basicButton.Enabled = true;
+                              hookButton.Enabled = true;
+                          });
+                      });
+                  }
+              }
+          }
+          EOF_G
+
+          cat > poc/App/Tests.cs <<'EOF_H'
+          using System;
+          using System.Diagnostics;
+          using System.IO;
+          using System.Linq;
+          using System.Reflection;
+          using System.Reflection.Emit;
+          using System.Runtime.CompilerServices;
+          using System.Runtime.InteropServices;
+          using System.Text;
+
+          namespace TMLiOSTest
+          {
+              public static class Tests
+              {
+                  const int MAP_PRIVATE = 0x2;
+                  const int MAP_ANON = 0x1000;
+                  const int MAP_JIT = 0x800;
+
+                  [DllImport("/usr/lib/libSystem.dylib", SetLastError = true)]
+                  static extern IntPtr mmap(IntPtr addr, UIntPtr length, int prot, int flags, int fd, IntPtr offset);
+
+                  [DllImport("/usr/lib/libSystem.dylib")]
+                  static extern int munmap(IntPtr addr, UIntPtr length);
+
+                  static Assembly modAsm;
+
+                  public static string DocsDir
+                  {
+                      get { return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments); }
+                  }
+
+                  static string MonoModStatePath
+                  {
+                      get { return Path.Combine(DocsDir, "monomod-state.txt"); }
+                  }
+
+                  public static string PreviousMonoModState()
+                  {
+                      try
+                      {
+                          if (!File.Exists(MonoModStatePath)) return "never run";
+                          string s = File.ReadAllText(MonoModStatePath);
+                          return s == "started" ? "CRASHED (the app was killed during the test)" : s;
+                      }
+                      catch (Exception e)
+                      {
+                          return "unreadable: " + e.Message;
+                      }
+                  }
+
+                  static void Section(StringBuilder sb, string name, Func<string> f)
+                  {
+                      sb.AppendLine("== " + name);
+                      try
+                      {
+                          sb.AppendLine(f());
+                      }
+                      catch (Exception e)
+                      {
+                          sb.AppendLine("FAILED: " + e.GetType().Name + ": " + e.Message);
+                      }
+                      sb.AppendLine();
+                  }
+
+                  public static string RunBasic()
+                  {
+                      var sb = new StringBuilder();
+                      Section(sb, "Runtime info", Info);
+                      Section(sb, "JIT memory probe (RWX mmap)", JitProbe);
+                      Section(sb, "DynamicMethod (runtime IL)", DynMethod);
+                      Section(sb, "Load assembly from bytes (mod-style)", LoadMod);
+                      Section(sb, "Speed: app code vs loaded assembly", Speed);
+                      return sb.ToString();
+                  }
+
+                  static string Info()
+                  {
+                      var sb = new StringBuilder();
+                      sb.AppendLine("Framework: " + RuntimeInformation.FrameworkDescription);
+                      sb.AppendLine("OS: " + RuntimeInformation.OSDescription);
+                      sb.AppendLine("Process arch: " + RuntimeInformation.ProcessArchitecture);
+                      sb.AppendLine("Mono runtime: " + (Type.GetType("Mono.Runtime") != null));
+                      sb.AppendLine("IsDynamicCodeSupported: " + RuntimeFeature.IsDynamicCodeSupported);
+                      sb.Append("IsDynamicCodeCompiled: " + RuntimeFeature.IsDynamicCodeCompiled);
+                      return sb.ToString();
+                  }
+
+                  static string JitProbe()
+                  {
+                      var sb = new StringBuilder();
+                      bool anyAllowed = false;
+                      var variants = new[]
+                      {
+                          Tuple.Create("plain RWX mmap", MAP_PRIVATE | MAP_ANON),
+                          Tuple.Create("MAP_JIT RWX mmap", MAP_PRIVATE | MAP_ANON | MAP_JIT)
+                      };
+                      foreach (var v in variants)
+                      {
+                          IntPtr p = mmap(IntPtr.Zero, new UIntPtr(16384u), 7, v.Item2, -1, IntPtr.Zero);
+                          if (p == new IntPtr(-1))
+                          {
+                              sb.AppendLine(v.Item1 + ": DENIED (errno " + Marshal.GetLastWin32Error() + ")");
+                          }
+                          else
+                          {
+                              anyAllowed = true;
+                              sb.AppendLine(v.Item1 + ": ALLOWED");
+                              munmap(p, new UIntPtr(16384u));
+                          }
+                      }
+                      sb.Append(anyAllowed
+                          ? "=> JIT memory IS available to this process."
+                          : "=> No JIT memory. Enable JIT for this app (StikDebug) and run again.");
+                      return sb.ToString();
+                  }
+
+                  static string DynMethod()
+                  {
+                      var dm = new DynamicMethod("Add", typeof(int), new Type[] { typeof(int), typeof(int) }, typeof(Tests).Module, true);
+                      var il = dm.GetILGenerator();
+                      il.Emit(OpCodes.Ldarg_0);
+                      il.Emit(OpCodes.Ldarg_1);
+                      il.Emit(OpCodes.Add);
+                      il.Emit(OpCodes.Ret);
+                      var f = (Func<int, int, int>)dm.CreateDelegate(typeof(Func<int, int, int>));
+                      return "DynamicMethod 2+3 = " + f(2, 3);
+                  }
+
+                  static string LoadMod()
+                  {
+                      using (var s = typeof(Tests).Assembly.GetManifestResourceStream("TestMod.dll"))
+                      {
+                          if (s == null) return "embedded TestMod.dll not found";
+                          using (var ms = new MemoryStream())
+                          {
+                              s.CopyTo(ms);
+                              modAsm = Assembly.Load(ms.ToArray());
+                          }
+                      }
+                      var t = modAsm.GetType("TestMod.ModEntry", true);
+                      var m = t.GetMethod("Run", BindingFlags.Public | BindingFlags.Static);
+                      return "Loaded OK. " + m.Invoke(null, null);
+                  }
+
+                  [MethodImpl(MethodImplOptions.NoInlining)]
+                  static long HostBench(int n)
+                  {
+                      long s = 0;
+                      for (int i = 1; i <= n; i++)
+                      {
+                          s += (i * 7L) % 13 + (i ^ (i >> 3));
+                      }
+                      return s;
+                  }
+
+                  static string Speed()
+                  {
+                      if (modAsm == null) return "skipped (mod assembly did not load)";
+                      var bench = modAsm.GetType("TestMod.ModEntry", true).GetMethod("Bench");
+                      var del = (Func<int, long>)Delegate.CreateDelegate(typeof(Func<int, long>), bench);
+                      const int N = 5000000;
+
+                      var sw = Stopwatch.StartNew();
+                      long a = HostBench(N);
+                      sw.Stop();
+                      double hostMs = sw.Elapsed.TotalMilliseconds;
+
+                      sw.Restart();
+                      long b = del(N);
+                      sw.Stop();
+                      double modMs = sw.Elapsed.TotalMilliseconds;
+
+                      return "app code: " + hostMs.ToString("F0") + " ms\n" +
+                             "loaded assembly: " + modMs.ToString("F0") + " ms\n" +
+                             "slowdown: " + (modMs / Math.Max(hostMs, 0.001)).ToString("F1") + "x\n" +
+                             "results match: " + (a == b);
+                  }
+
+                  [MethodImpl(MethodImplOptions.NoInlining)]
+                  public static int Target(int x)
+                  {
+                      return x + 1;
+                  }
+
+                  public static string RunMonoMod()
+                  {
+                      File.WriteAllText(MonoModStatePath, "started");
+                      string result;
+                      try
+                      {
+                          result = MonoModHook();
+                      }
+                      catch (Exception e)
+                      {
+                          result = "FAILED: " + e.GetType().Name + ": " + e.Message;
+                      }
+                      File.WriteAllText(MonoModStatePath, "finished: " + result);
+                      return result;
+                  }
+
+                  static string MonoModHook()
+                  {
+                      Assembly asm;
+                      try
+                      {
+                          asm = Assembly.Load("MonoMod.RuntimeDetour");
+                      }
+                      catch (FileNotFoundException)
+                      {
+                          return "MonoMod is not in this build (it was switched off).";
+                      }
+
+                      var hookType = asm.GetType("MonoMod.RuntimeDetour.Hook", true);
+                      var target = typeof(Tests).GetMethod("Target", BindingFlags.Public | BindingFlags.Static);
+                      Func<Func<int, int>, int, int> replacement = (orig, x) => orig(x) * 100;
+
+                      int before = Target(1);
+                      object hook = null;
+                      foreach (var ctor in hookType.GetConstructors())
+                      {
+                          var ps = ctor.GetParameters();
+                          if (ps.Length == 2 && ps[0].ParameterType.IsAssignableFrom(typeof(MethodInfo)) && ps[1].ParameterType == typeof(Delegate))
+                          {
+                              hook = ctor.Invoke(new object[] { target, replacement });
+                              break;
+                          }
+                      }
+                      if (hook == null)
+                      {
+                          return "No (method, delegate) constructor found. Constructors: " +
+                                 string.Join(" | ", hookType.GetConstructors().Select(c => c.ToString()));
+                      }
+
+                      int after = Target(1);
+                      var d = hook as IDisposable;
+                      if (d != null) d.Dispose();
+                      int restored = Target(1);
+                      return "before=" + before + " after=" + after + " restored=" + restored + " -> " +
+                             (after == 200 ? "HOOK WORKED" : "hook did not change the method");
+                  }
+              }
+          }
+          EOF_H
+
+      - name: Build the test mod
+        run: |
+          set -eo pipefail
+          dotnet build poc/TestMod/TestMod.csproj -c Release -o poc/modout -v:minimal
+          cp poc/modout/TestMod.dll poc/App/TestMod.dll
+
+      - name: Build the iOS app (unsigned)
+        run: |
+          set -eo pipefail
+          cd poc/App
+          dotnet build TMLiOSTest.csproj -c Release -r ios-arm64 \
+            -p:EnableCodeSigning=false \
+            -p:BuildIpa=false \
+            -p:ArchiveOnBuild=false \
+            -p:ValidateXcodeVersion=false \
+            -p:WithMonoMod=${{ inputs.include_monomod }} \
+            -v:minimal 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Package unsigned IPA
+        run: |
+          set -eo pipefail
+          APP=$(find poc/App/bin -maxdepth 6 -type d -name "*.app" | head -n 1)
+          echo "App bundle: $APP"
+          test -n "$APP"
+          rm -rf ipa
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../TMLiOSTest-unsigned.ipa Payload)
+          ls -lh TMLiOSTest-unsigned.ipa
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## iOS runtime test"
+            if [ -f TMLiOSTest-unsigned.ipa ]; then
+              echo "Build OK. Download **ios-ipa** under *Artifacts* at the bottom of this page."
+            else
+              echo "Build FAILED. Copy the lines below and send them to Claude."
+              echo "If the box is empty, open the red step above and copy its last lines instead."
+              echo '```'
+              (grep -hE "error|MSB[0-9]+|NETSDK[0-9]+|MT[0-9]{4}" build.log 2>/dev/null | sort -u | head -n 40) || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: TMLiOSTest-unsigned.ipa
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
